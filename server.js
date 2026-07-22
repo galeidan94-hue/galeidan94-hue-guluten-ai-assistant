@@ -1,71 +1,145 @@
-# עוזר AI לחנות
+// שרת פשוט שמקבל הודעות מהצ'אט באתר, מוסיף להן את בסיס הידע (FAQ + מוצרים),
+// שולח את זה ל-OpenAI API, ומחזיר את התשובה לווידג'ט.
 
-עוזר AI שעונה על שאלות נפוצות, ממליץ על מוצרים, ומציע מתכונים - להטמעה כווידג'ט צ'אט באתר שלך.
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
 
-## מה יש כאן
-- `server.js` - שרת שמדבר עם OpenAI API
-- `data/faq.json` - שאלות נפוצות (לערוך לפי החנות שלך)
-- `data/products.json` - קטלוג מוצרים (לערוך לפי החנות שלך)
-- `public/widget.js` - הקוד שמטמיעים באתר
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-## שלב 1: התקנה מקומית
-1. ודא/י שמותקן Node.js (גרסה 18 ומעלה) - להורדה מ-nodejs.org
-2. בטרמינל, בתוך תיקיית הפרויקט:
-   ```
-   npm install
-   ```
-3. העתק/י את `.env.example` לקובץ בשם `.env`, והכנס/י שם את מפתח ה-API שלך:
-   ```
-   OPENAI_API_KEY=sk-...
-   ```
-   מפתח מקבלים בכתובת platform.openai.com (תחת API Keys) - שים לב שזה חשבון נפרד מהמנוי הרגיל ל-ChatGPT, ותשלום הוא לפי שימוש.
-4. הרץ/י את השרת:
-   ```
-   npm start
-   ```
-   השרת ירוץ על `http://localhost:3000`
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const PORT = process.env.PORT || 3000;
 
-## שלב 2: עדכון בסיס הידע
-ערוך/י את `data/faq.json` ו-`data/products.json` עם המידע האמיתי של החנות שלך (משלוחים, מדיניות החזרות, המוצרים בפועל, מחירים, קישורים). השרת קורא את הקבצים האלה בכל בקשה, כך שאפשר לעדכן בלי להפעיל מחדש את השרת.
+if (!OPENAI_API_KEY) {
+  console.warn('אזהרה: לא הוגדר OPENAI_API_KEY בקובץ .env - הקריאות ל-API ייכשלו.');
+}
 
-## שלב 3: פרסום השרת (Deployment)
-כדי שהאתר האמיתי יוכל להתחבר לשרת, צריך להעלות אותו לאחסון ציבורי. אפשרויות פשוטות וזולות:
-- **Render.com** - יש להם תוכנית חינמית לפרויקטים קטנים
-- **Railway.app**
-- **Fly.io**
+// בסיס הידע נטען פעם אחת לזיכרון ומתעדכן כל כמה דקות - כך שאין קריאת דיסק
+// יקרה בכל בקשה, אבל עדכון קבצים עדיין נכנס לתוקף בלי להפעיל מחדש את השרת.
+let cache = { faq: [], products: [], loadedAt: 0 };
+const RELOAD_INTERVAL_MS = 5 * 60 * 1000; // 5 דקות
 
-בכל השירותים האלה: מחברים את הריפו של הקוד, מגדירים את משתנה הסביבה `OPENAI_API_KEY`, ומקבלים כתובת ציבורית (למשל `https://your-app.onrender.com`).
+function loadKnowledge() {
+  const now = Date.now();
+  if (now - cache.loadedAt < RELOAD_INTERVAL_MS && cache.products.length) {
+    return cache;
+  }
+  const faq = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'faq.json'), 'utf8'));
+  const products = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'products.json'), 'utf8'));
+  cache = { faq, products, loadedAt: now };
+  return cache;
+}
 
-## שלב 4: הטמעה באתר
-בכל עמוד באתר שבו רוצים שהצ'אט יופיע, מוסיפים לפני סגירת ה-`</body>` את התגית:
+// הקטלוג כולל כ-1400 מוצרים - יותר מדי כדי לשלוח את כולו בכל בקשה (יקר, איטי, ומבלבל את המודל).
+// במקום זה מחפשים רק את המוצרים הרלוונטיים להודעה של הלקוח, לפי חפיפת מילים בשם/קטגוריה/מותג/תיאור.
+const STOPWORDS = new Set(['את','של','עם','אני','אתה','את','יש','אין','זה','זו','על','אם','לא','כן','גם','או','מה','איך','למה','כמה','אפשר','רוצה','רוצים','תמליץ','המלצה','טוב','בשביל','עבור']);
 
-```html
-<script src="https://your-app.onrender.com/widget.js"
-        data-endpoint="https://your-app.onrender.com/api/chat"></script>
-```
+function tokenize(text) {
+  return text
+    .replace(/[^\u0590-\u05FFa-zA-Z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length >= 2 && !STOPWORDS.has(w));
+}
 
-זהו - בועת צ'אט תופיע בפינת המסך, ולקוחות יוכלו לשוחח עם העוזר.
+function searchProducts(query, products, limit = 15) {
+  const tokens = tokenize(query);
+  if (!tokens.length) return [];
 
-### אם כבר יש כפתור וואטסאפ קיים באתר
-אם באתר כבר מותקן כפתור/קישור שמוביל לוואטסאפ (כמו כפתור "יש לכם שאלה?"), הקוד **מזהה אותו אוטומטית** ומחליף את ההתנהגות שלו - הלחיצה עליו תפתח את חלון הצ'אט של ה-AI במקום לנווט לוואטסאפ. במקרה כזה בועת הצ'אט הרגילה שלנו לא תוצג בכלל, כדי שלא יהיו שני כפתורים כפולים על המסך. אין צורך לגעת בכפתור הקיים או להחליף בו קישורים - זה קורה אוטומטית ברגע שמדביקים את שורת הקוד.
-בתוך חלון הצ'אט יש גם קישור קטן "לחצו כאן לוואטסאפ" למקרה שלקוח מעדיף לדבר עם נציג אנושי - כך שהערוץ הישן לא נעלם, רק הופך לאופציה נוספת.
+  const scored = products.map(p => {
+    const haystack = `${p.name} ${p.category} ${p.description}`;
+    let score = 0;
+    for (const t of tokens) {
+      if (haystack.includes(t)) score += 1;
+    }
+    return { p, score };
+  }).filter(x => x.score > 0);
 
-## הערות חשובות
-- **עלויות**: יש עלות לכל קריאה ל-OpenAI API (לפי כמות טוקנים). מודל `gpt-4o-mini` זול ומספיק טוב לרוב השימושים; אפשר לשנות דגם דרך `OPENAI_MODEL` ב-`.env`.
-- **אבטחה**: מפתח ה-API נשאר תמיד בצד השרת (בקובץ `.env`) ולעולם לא נחשף לצד הלקוח.
-- **התאמת ה"אישיות"**: אפשר לערוך את הטקסט בפונקציה `buildSystemPrompt` בתוך `server.js` כדי לשנות את הטון, ההנחיות, ומה מותר/אסור לעוזר לענות עליו.
-- **מלאי בזמן אמת**: כרגע `products.json` הוא קובץ סטטי (מיוצא מ-WooCommerce). בהמשך, אם תרצה חיבור אוטומטי למערכת הניהול של החנות, זה ידרוש שדרוג לקריאת API ממערכת המלאי בזמן אמת במקום קובץ.
+  scored.sort((a, b) => b.score - a.score || (b.p.in_stock ? 1 : 0) - (a.p.in_stock ? 1 : 0));
+  return scored.slice(0, limit).map(x => x.p);
+}
 
-## חיפוש מוצרים חכם (חשוב להבין)
-הקטלוג כולל כ-1400 מוצרים. אי אפשר לשלוח את כולם ל-OpenAI בכל שיחה (זה יקר, איטי, ומבלבל את המודל). לכן השרת מבצע **חיפוש מילות מפתח** על ההודעה של הלקוח (`searchProducts` בתוך `server.js`), ושולח ל-AI רק את 15 המוצרים הכי רלוונטיים לשאלה. זה עובד טוב לרוב המקרים, אבל יש לו מגבלות:
-- זה חיפוש לפי מילים מדויקות (לא "מבין" נרדפות מורכבות)
-- אם הלקוח שואל שאלה כללית מדי, ייתכן שלא יימצאו התאמות - במקרה כזה העוזר יופנה להציע ללקוח לחפש באתר או לנסח מחדש
-- שדרוג עתידי אפשרי: חיפוש סמנטי (embeddings) שמבין כוונה ולא רק מילים - שווה לשקול אם ההמלצות לא מספיק מדויקות בפועל
+function buildSystemPrompt(userMessage) {
+  const { faq, products } = loadKnowledge();
 
-## מגבלת קישורים - נפתרה!
-בזכות קובץ ה-Export של וורדפרס (XML) שקיבלתי, לכל מוצר עכשיו יש קישור אמיתי לדף המוצר באתר. העוזר יודע לשתף אותו כשהוא ממליץ על מוצר, כך שהלקוח יכול ללחוץ ולעבור ישר לרכישה.
+  const faqText = faq.map(f => `שאלה: ${f.question}\nתשובה: ${f.answer}`).join('\n\n');
 
-בקטלוג יש **1117 מוצרים פעילים (Publish)** - סוננו החוצה 332 מוצרים שהיו טיוטה (Draft) ולא זמינים בפועל באתר.
+  const relevant = searchProducts(userMessage, products);
+  const productsText = relevant.length
+    ? relevant.map(p =>
+        `- ${p.name} | קטגוריה: ${p.category} | מחיר: ${p.price} ש"ח | במלאי: ${p.in_stock ? 'כן' : 'לא'} | קישור: ${p.url}`
+      ).join('\n')
+    : '(לא נמצאו מוצרים תואמים לשאלה זו מתוך החיפוש האוטומטי - אם השאלה עוסקת במוצר ספציפי, אפשר להציע ללקוח לחפש באתר או לשאול בניסוח אחר.)';
 
-## הערה לגבי כשרות ותמונות
-לפי ה-FAQ, לא כל מוצר בחנות כשר, והכשרות מצוינת בעמוד המוצר עצמו - זה לא מידע שקיים בקובץ המוצרים. העוזר מונחה שלא להמציא מידע על כשרות של מוצר ספציפי, ולהפנות לבדיקה באתר או ליצירת קשר. אותו דבר לגבי התאמה מדויקת של תמונות המוצר.
+  return `את/ה עוזר/ת AI ידידותי/ת של חנות "גולוטן" - חנות אונליין למוצרים ללא גלוטן. תפקידך:
+1. לענות על שאלות נפוצות בהתאם למידע שמופיע כאן בלבד - אסור להמציא מדיניות שלא מופיעה במידע.
+2. להמליץ על מוצרים מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה). אם מוצר לא במלאי, ציין זאת בעדינות והצע חלופה מהרשימה אם יש. תמיד שתף את הקישור למוצר כשמזכירים אותו, כדי שהלקוח יוכל ללחוץ ולעבור ישירות לרכישה.
+3. להציע מתכונים ורעיונות בישול על סמך הידע הכללי שלך - זה לא חייב להיות מוגבל למידע שכאן, ואפשר לשלב בהם המלצה למוצר מהרשימה (עם קישור) אם רלוונטי.
+4. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
+5. אם נשאלת שאלה שאין עליה מידע (למשל ייעוץ רפואי, כשרות של מוצר ספציפי שלא ברשימה), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351.
+6. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
+
+מידע נפוץ (FAQ):
+${faqText}
+
+מוצרים רלוונטיים לשאלה הנוכחית:
+${productsText}`;
+}
+
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body;
+
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'חסרה הודעה (message) בבקשה' });
+    }
+
+    const systemPrompt = buildSystemPrompt(message);
+
+    // history הוא מערך אופציונלי של הודעות קודמות בפורמט [{role: 'user'|'assistant', content: '...'}]
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...(Array.isArray(history) ? history : []),
+      { role: 'user', content: message },
+    ];
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages,
+        temperature: 0.6,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('OpenAI API error:', errText);
+      return res.status(502).json({ error: 'שגיאה בפנייה ל-OpenAI API' });
+    }
+
+    const data = await response.json();
+    const reply = data.choices?.[0]?.message?.content?.trim() || 'מצטער, לא הצלחתי לייצר תשובה כרגע.';
+
+    res.json({ reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'שגיאת שרת פנימית' });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, () => {
+  console.log(`השרת פועל על פורט ${PORT}`);
+});

@@ -1,3 +1,17 @@
-OPENAI_API_KEY=sk-your-key-here
-OPENAI_MODEL=gpt-4o-mini
-PORT=3000
+{
+  "name": "store-ai-assistant",
+  "version": "1.0.0",
+  "description": "עוזר AI לחנות - תמיכה, המלצות מוצרים ומתכונים, מבוסס OpenAI API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
