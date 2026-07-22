@@ -73,10 +73,25 @@
   const inputEl = document.getElementById('input');
   const sendBtn = document.getElementById('send');
 
+  function linkify(text) {
+    const escaped = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+      const clean = url.replace(/[.,)\]]+$/, '');
+      return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>`;
+    });
+  }
+
   function addMessage(who, text) {
     const el = document.createElement('div');
     el.className = 'msg ' + (who === 'user' ? 'user' : 'bot');
-    el.innerText = text;
+    if (who === 'user') {
+      el.innerText = text;
+    } else {
+      el.innerHTML = linkify(text);
+    }
     msgsEl.appendChild(el);
     msgsEl.scrollTop = msgsEl.scrollHeight;
   }
