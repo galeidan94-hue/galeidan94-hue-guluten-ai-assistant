@@ -20,7 +20,9 @@ if (!OPENAI_API_KEY) {
   console.warn('אזהרה: לא הוגדר OPENAI_API_KEY בקובץ .env - הקריאות ל-API ייכשלו.');
 }
 
-let cache = { faq: [], products: [], loadedAt: 0 };
+// בסיס הידע נטען פעם אחת לזיכרון ומתעדכן כל כמה דקות - כך שאין קריאת דיסק
+// יקרה בכל בקשה, אבל עדכון קבצים עדיין נכנס לתוקף בלי להפעיל מחדש את השרת.
+let cache = { faq: [], products: [], recipes: [], loadedAt: 0 };
 const RELOAD_INTERVAL_MS = 5 * 60 * 1000; // 5 דקות
 
 function loadKnowledge() {
@@ -30,10 +32,18 @@ function loadKnowledge() {
   }
   const faq = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'faq.json'), 'utf8'));
   const products = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'products.json'), 'utf8'));
-  cache = { faq, products, loadedAt: now };
+  let recipes = [];
+  try {
+    recipes = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'recipes.json'), 'utf8'));
+  } catch (e) {
+    recipes = [];
+  }
+  cache = { faq, products, recipes, loadedAt: now };
   return cache;
 }
 
+// הקטלוג כולל כ-1400 מוצרים - יותר מדי כדי לשלוח את כולו בכל בקשה (יקר, איטי, ומבלבל את המודל).
+// במקום זה מחפשים רק את המוצרים הרלוונטיים להודעה של הלקוח, לפי חפיפת מילים בשם/קטגוריה/מותג/תיאור.
 const STOPWORDS = new Set(['את','של','עם','אני','אתה','את','יש','אין','זה','זו','על','אם','לא','כן','גם','או','מה','איך','למה','כמה','אפשר','רוצה','רוצים','תמליץ','המלצה','טוב','בשביל','עבור']);
 
 function tokenize(text) {
@@ -61,23 +71,45 @@ function searchProducts(query, products, limit = 15) {
   return scored.slice(0, limit).map(x => x.p);
 }
 
+function searchRecipes(query, recipes, limit = 5) {
+  const tokens = tokenize(query);
+  if (!tokens.length || !recipes.length) return [];
+
+  const scored = recipes.map(r => {
+    const haystack = `${r.title} ${r.tags} ${r.summary || ''}`;
+    let score = 0;
+    for (const t of tokens) {
+      if (haystack.includes(t)) score += 1;
+    }
+    return { r, score };
+  }).filter(x => x.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(x => x.r);
+}
+
 function buildSystemPrompt(userMessage) {
-  const { faq, products } = loadKnowledge();
+  const { faq, products, recipes } = loadKnowledge();
 
   const faqText = faq.map(f => `שאלה: ${f.question}\nתשובה: ${f.answer}`).join('\n\n');
 
   const relevant = searchProducts(userMessage, products);
   const productsText = relevant.length
     ? relevant.map(p =>
-        `- ${p.name} | קטגוריה: ${p.category} | מחיר: ${p.price} ש"ח | במלאי: ${p.in_stock ? 'כן' : 'לא'} | קישור: ${p.url}`
+        `- ${p.name} | קטגוריה: ${p.category} | מחיר: ${p.price} ש"ח | במלאי: ${p.in_stock ? 'כן' : 'לא'} | קישור: ${p.url}\n  תיאור ורכיבים: ${p.description}`
       ).join('\n')
     : '(לא נמצאו מוצרים תואמים לשאלה זו מתוך החיפוש האוטומטי - אם השאלה עוסקת במוצר ספציפי, אפשר להציע ללקוח לחפש באתר או לשאול בניסוח אחר.)';
 
+  const relevantRecipes = searchRecipes(userMessage, recipes);
+  const recipesText = relevantRecipes.length
+    ? relevantRecipes.map(r => `- ${r.title} | תגיות: ${r.tags} | קישור: ${r.url}\n  תקציר: ${r.summary || ''}`).join('\n')
+    : '(אין כרגע מתכון תואם ידוע מהבלוג שלנו לשאלה הזו)';
+
   return `את/ה עוזר/ת AI ידידותי/ת של חנות "גולוטן" - חנות אונליין למוצרים ללא גלוטן. תפקידך:
 1. לענות על שאלות נפוצות בהתאם למידע שמופיע כאן בלבד - אסור להמציא מדיניות שלא מופיעה במידע.
-2. להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. אם השאלה עוסקת במוצר ספציפי שלא נמצא ברשימה, אמור בכנות שאין לך מידע מדויק עליו ברגע זה, והצע ללקוח לחפש אותו באתר או לנסח את השאלה אחרת - אל תנחש.
+2. להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. כל מוצר כולל תיאור עם רכיבים ואלרגנים אמיתיים - השתמש/י בהם כדי לענות על שאלות כמו "יש בזה סויה?" או "מה מתאים למישהו שנמנע מסוכר?". אם השאלה עוסקת במוצר ספציפי שלא נמצא ברשימה, אמור בכנות שאין לך מידע מדויק עליו ברגע זה, והצע ללקוח לחפש אותו באתר או לנסח את השאלה אחרת - אל תנחש.
 3. תמיד לצטט את הקישור (url) בדיוק כפי שהוא מופיע ברשימה, מילה במילה - אסור לקצר, לשנות, או להמציא קישור.
-4. להציע מתכונים ורעיונות בישול על סמך הידע הכללי שלך - זה לא חייב להיות מוגבל למידע שכאן, ואפשר לשלב בהם המלצה למוצר מהרשימה (עם קישור מדויק) אם רלוונטי.
+4. לגבי מתכונים: אם יש מתכון תואם ברשימת "מתכונים מהבלוג שלנו" למטה - קודם כל תפני/ה אליו עם הקישור המדויק שלו. אם אין מתכון תואם ברשימה, אפשר להציע רעיון מתכון או טיפ בישול מהידע הכללי שלך (למשל על סוגי קמחים ללא גלוטן) - אבל בסוף התשובה תמיד להזכיר שאפשר למצוא עוד מתכונים בבלוג שלנו בכתובת https://guluten.co.il/מתכונים. אסור להמציא קישור למתכון ספציפי שלא מופיע ברשימה.
 5. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
 6. אם נשאלת שאלה שאין עליה מידע (למשל ייעוץ רפואי, כשרות של מוצר ספציפי שלא ברשימה), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351.
 7. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
@@ -86,7 +118,10 @@ function buildSystemPrompt(userMessage) {
 ${faqText}
 
 מוצרים רלוונטיים לשאלה הנוכחית:
-${productsText}`;
+${productsText}
+
+מתכונים תואמים מהבלוג שלנו:
+${recipesText}`;
 }
 
 app.post('/api/chat', async (req, res) => {
@@ -99,6 +134,7 @@ app.post('/api/chat', async (req, res) => {
 
     const systemPrompt = buildSystemPrompt(message);
 
+    // history הוא מערך אופציונלי של הודעות קודמות בפורמט [{role: 'user'|'assistant', content: '...'}]
     const messages = [
       { role: 'system', content: systemPrompt },
       ...(Array.isArray(history) ? history : []),
