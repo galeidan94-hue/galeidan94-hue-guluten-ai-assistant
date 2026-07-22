@@ -46,37 +46,67 @@ function loadKnowledge() {
 // במקום זה מחפשים רק את המוצרים הרלוונטיים להודעה של הלקוח, לפי חפיפת מילים בשם/קטגוריה/מותג/תיאור.
 const STOPWORDS = new Set(['את','של','עם','אני','אתה','את','יש','אין','זה','זו','על','אם','לא','כן','גם','או','מה','איך','למה','כמה','אפשר','רוצה','רוצים','תמליץ','המלצה','טוב','בשביל','עבור']);
 
-function tokenize(text) {
+// מזהה ביטויי שלילה כמו "ללא סויה" / "בלי בוטנים" / "נטול לקטוז" ומוציא מהם את
+// הרכיב שיש להוציא לגמרי מהתוצאות - כדי שחיפוש "ללא X" לא יעלה בטעות מוצרים שמכילים X.
+const NEGATION_CUES = ['ללא', 'בלי', 'נטול', 'נטולת', 'ללא תוספת'];
+const NEGATION_FILLERS = new Set(['תוספת', 'עם', 'של', 'כל']);
+
+function extractExclusions(query) {
+  const words = query.replace(/[^\u0590-\u05FFa-zA-Z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const exclusions = [];
+  for (let i = 0; i < words.length; i++) {
+    if (NEGATION_CUES.includes(words[i])) {
+      let j = i + 1;
+      while (j < words.length && NEGATION_FILLERS.has(words[j])) j++;
+      if (j < words.length && words[j].length >= 2) {
+        exclusions.push(words[j]);
+      }
+    }
+  }
+  return exclusions;
+}
+
+function tokenize(text, excludeWords = []) {
+  const excludeSet = new Set(excludeWords);
   return text
     .replace(/[^\u0590-\u05FFa-zA-Z0-9\s]/g, ' ')
     .split(/\s+/)
     .map(w => w.trim())
-    .filter(w => w.length >= 2 && !STOPWORDS.has(w));
+    .filter(w => w.length >= 2 && !STOPWORDS.has(w) && !excludeSet.has(w));
 }
 
 function searchProducts(query, products, limit = 15) {
-  const tokens = tokenize(query);
-  if (!tokens.length) return [];
+  const exclusions = extractExclusions(query);
+  const tokens = tokenize(query, exclusions);
+  if (!tokens.length && !exclusions.length) return [];
 
-  const scored = products.map(p => {
+  let candidates = products;
+  if (exclusions.length) {
+    candidates = candidates.filter(p => {
+      const haystack = `${p.name} ${p.description}`;
+      return !exclusions.some(ex => haystack.includes(ex));
+    });
+  }
+
+  const scored = candidates.map(p => {
     const haystack = `${p.name} ${p.category} ${p.description}`;
     let score = 0;
     for (const t of tokens) {
       if (haystack.includes(t)) score += 1;
     }
     return { p, score };
-  }).filter(x => x.score > 0);
+  }).filter(x => tokens.length ? x.score > 0 : true);
 
   scored.sort((a, b) => b.score - a.score || (b.p.in_stock ? 1 : 0) - (a.p.in_stock ? 1 : 0));
   return scored.slice(0, limit).map(x => x.p);
 }
 
-function searchRecipes(query, recipes, limit = 5) {
+function searchRecipes(query, recipes, limit = 3) {
   const tokens = tokenize(query);
   if (!tokens.length || !recipes.length) return [];
 
   const scored = recipes.map(r => {
-    const haystack = `${r.title} ${r.tags} ${r.summary || ''}`;
+    const haystack = `${r.title} ${r.tags} ${r.summary || ''} ${(r.ingredients || []).join(' ')} ${(r.steps || []).join(' ')}`;
     let score = 0;
     for (const t of tokens) {
       if (haystack.includes(t)) score += 1;
@@ -102,16 +132,29 @@ function buildSystemPrompt(userMessage) {
 
   const relevantRecipes = searchRecipes(userMessage, recipes);
   const recipesText = relevantRecipes.length
-    ? relevantRecipes.map(r => `- ${r.title} | תגיות: ${r.tags} | קישור: ${r.url}\n  תקציר: ${r.summary || ''}`).join('\n')
+    ? relevantRecipes.map(r => {
+        const ingredientsList = (r.ingredients || []).map(i => `    - ${i}`).join('\n');
+        const stepsList = (r.steps || []).map((s, i) => `    ${i + 1}. ${s}`).join('\n');
+        return `- ${r.title} | תגיות: ${r.tags} | זמן הכנה: ${r.cooking_time || 'לא צוין'} | קישור: ${r.url}\n  מרכיבים:\n${ingredientsList}\n  שלבי הכנה:\n${stepsList}`;
+      }).join('\n\n')
     : '(אין כרגע מתכון תואם ידוע מהבלוג שלנו לשאלה הזו)';
+
+  const productCategories = [...new Set(products.map(p => p.category).filter(Boolean))];
+  const recipeCategories = [...new Set(
+    recipes.flatMap(r => (r.tags || '').split(',').map(t => t.trim()).filter(Boolean))
+  )];
 
   return `את/ה עוזר/ת AI ידידותי/ת של חנות "גולוטן" - חנות אונליין למוצרים ללא גלוטן. תפקידך:
 1. לענות על שאלות נפוצות בהתאם למידע שמופיע כאן בלבד - אסור להמציא מדיניות שלא מופיעה במידע.
-2. להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. כל מוצר כולל תיאור עם רכיבים ואלרגנים אמיתיים - השתמש/י בהם כדי לענות על שאלות כמו "יש בזה סויה?" או "מה מתאים למישהו שנמנע מסוכר?". אם השאלה עוסקת במוצר ספציפי שלא נמצא ברשימה, אמור בכנות שאין לך מידע מדויק עליו ברגע זה, והצע ללקוח לחפש אותו באתר או לנסח את השאלה אחרת - אל תנחש.
-3. תמיד לצטט את הקישור (url) בדיוק כפי שהוא מופיע ברשימה, מילה במילה - אסור לקצר, לשנות, או להמציא קישור.
-4. לגבי מתכונים: אם יש מתכון תואם ברשימת "מתכונים מהבלוג שלנו" למטה - קודם כל תפני/ה אליו עם הקישור המדויק שלו. אם אין מתכון תואם ברשימה, אפשר להציע רעיון מתכון או טיפ בישול מהידע הכללי שלך (למשל על סוגי קמחים ללא גלוטן) - אבל בסוף התשובה תמיד להזכיר שאפשר למצוא עוד מתכונים בבלוג שלנו בכתובת https://guluten.co.il/מתכונים. אסור להמציא קישור למתכון ספציפי שלא מופיע ברשימה.
+2. חשוב מאוד לגבי מתכונים ובישול:
+   - יש לך למטה רשימת "מתכונים תואמים מהבלוג שלנו" - כל מתכון שם כולל מרכיבים מדויקים ושלבי הכנה מלאים. אם הרשימה לא ריקה, את/ה **חייב/ת** לתת ללקוח את תוכן המתכון בפועל (מרכיבים ושלבים עיקריים, אפשר בקצרה) יחד עם הקישור המדויק שלו - לא רק להזכיר שהוא קיים, אלא לעזור בפועל עם התוכן שלו.
+   - אם יש כמה מתכונים תואמים, אפשר להזכיר את כולם בקצרה ולתת קישור לכל אחד, ולהתמקד במתכון המתאים ביותר.
+   - אם אין שום מתכון תואם ברשימה: אל תמציא/י מתכון מיד. קודם תשאל/י את הלקוח בנימוס: "אין לנו כרגע מתכון כזה בבלוג שלנו - תרצה/י שאציע לך רעיון כללי, או שנפנה אותך לחפש בעמוד המתכונים שלנו: https://guluten.co.il/מתכונים?". רק אם הלקוח מאשר שהוא רוצה הצעה כללית, אפשר לתת רעיון מתכון מהידע הכללי שלך על בישול ואפייה ללא גלוטן (כולל סוגי קמחים ללא גלוטן) - אבל תמיד לציין בבירור שזו הצעה כללית ולא מתכון מהבלוג שלנו.
+   - אסור להמציא קישור למתכון ספציפי שלא מופיע ברשימה שסופקה.
+3. חשוב לגבי מוצרים: להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה, ומסננת אוטומטית מוצרים עם רכיבים שהלקוח ביקש להימנע מהם) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. כל מוצר כולל תיאור עם רכיבים ואלרגנים אמיתיים - השתמש/י בהם כדי לענות על שאלות כמו "יש בזה סויה?" או "מה מתאים למישהו שנמנע מסוכר?". אם השאלה עוסקת במוצר ספציפי שלא נמצא ברשימה, אמור בכנות שאין לך מידע מדויק עליו ברגע זה, והצע ללקוח לחפש אותו באתר או לנסח את השאלה אחרת - אל תנחש. תמיד לצטט את הקישור (url) של מוצר בדיוק כפי שהוא מופיע ברשימה, מילה במילה.
+4. קטגוריות: יש לך למטה רשימה של כל קטגוריות המוצרים והמתכונים שקיימות בחנות. אם לקוח שואל "אילו סוגים יש לכם של X" או מחפש קטגוריה כללית, אפשר להיעזר ברשימה הזו כדי לענות בביטחון אילו קטגוריות קיימות, גם אם החיפוש האוטומטי לא החזיר מוצרים ספציפיים.
 5. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
-6. אם נשאלת שאלה שאין עליה מידע (למשל ייעוץ רפואי, כשרות של מוצר ספציפי שלא ברשימה), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351.
+6. אם נשאלת שאלה שאין עליה מידע מדויק על החנות עצמה (למשל כשרות של מוצר ספציפי שלא ברשימה, מדיניות שלא מופיעה כאן), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351. הכלל הזה חל על עובדות ספציפיות על החנות/המוצרים - לא על ידע כללי בבישול, מתכונים, או תזונה, ששם מותר לך לענות בביטחון מהידע הכללי שלך (בכפוף לכלל 2 לגבי בקשת אישור לפני הצעת מתכון חיצוני).
 7. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
 
 מידע נפוץ (FAQ):
@@ -121,7 +164,13 @@ ${faqText}
 ${productsText}
 
 מתכונים תואמים מהבלוג שלנו:
-${recipesText}`;
+${recipesText}
+
+קטגוריות מוצרים קיימות בחנות:
+${productCategories.join(', ')}
+
+קטגוריות מתכונים קיימות בבלוג:
+${recipeCategories.join(', ')}`;
 }
 
 app.post('/api/chat', async (req, res) => {
