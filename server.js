@@ -66,13 +66,34 @@ function extractExclusions(query) {
   return exclusions;
 }
 
+// עברית מדביקה מילות יחס (ו/ב/כ/ל/מ/ש/ה) בתחילת מילים ("לעוגיות", "בלחם") -
+// בלי טיפול בזה, חיפוש מילולי פשוט מפספס התאמות. מייצרים גם גרסה בלי הקידומת.
+const HEBREW_PREFIXES = new Set(['ו', 'ב', 'כ', 'ל', 'מ', 'ש', 'ה']);
+
+function stripHebrewPrefixes(word) {
+  const variants = new Set([word]);
+  let w = word;
+  for (let i = 0; i < 2; i++) {
+    if (w.length > 3 && HEBREW_PREFIXES.has(w[0])) {
+      w = w.slice(1);
+      if (w.length >= 2) variants.add(w);
+    } else {
+      break;
+    }
+  }
+  return [...variants];
+}
+
 function tokenize(text, excludeWords = []) {
   const excludeSet = new Set(excludeWords);
-  return text
+  const rawWords = text
     .replace(/[^\u0590-\u05FFa-zA-Z0-9\s]/g, ' ')
     .split(/\s+/)
     .map(w => w.trim())
     .filter(w => w.length >= 2 && !STOPWORDS.has(w) && !excludeSet.has(w));
+
+  const withVariants = rawWords.flatMap(w => stripHebrewPrefixes(w));
+  return [...new Set(withVariants)];
 }
 
 function searchProducts(query, products, limit = 15) {
@@ -118,19 +139,20 @@ function searchRecipes(query, recipes, limit = 3) {
   return scored.slice(0, limit).map(x => x.r);
 }
 
-function buildSystemPrompt(userMessage) {
+function buildSystemPrompt(userMessage, searchContext) {
   const { faq, products, recipes } = loadKnowledge();
+  const queryForSearch = searchContext || userMessage;
 
   const faqText = faq.map(f => `שאלה: ${f.question}\nתשובה: ${f.answer}`).join('\n\n');
 
-  const relevant = searchProducts(userMessage, products);
+  const relevant = searchProducts(queryForSearch, products);
   const productsText = relevant.length
     ? relevant.map(p =>
         `- ${p.name} | קטגוריה: ${p.category} | מחיר: ${p.price} ש"ח | במלאי: ${p.in_stock ? 'כן' : 'לא'} | קישור: ${p.url}\n  תיאור ורכיבים: ${p.description}`
       ).join('\n')
     : '(לא נמצאו מוצרים תואמים לשאלה זו מתוך החיפוש האוטומטי - אם השאלה עוסקת במוצר ספציפי, אפשר להציע ללקוח לחפש באתר או לשאול בניסוח אחר.)';
 
-  const relevantRecipes = searchRecipes(userMessage, recipes);
+  const relevantRecipes = searchRecipes(queryForSearch, recipes);
   const recipesText = relevantRecipes.length
     ? relevantRecipes.map(r => {
         const ingredientsList = (r.ingredients || []).map(i => `    - ${i}`).join('\n');
@@ -181,7 +203,15 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'חסרה הודעה (message) בבקשה' });
     }
 
-    const systemPrompt = buildSystemPrompt(message);
+    // כדי שתשובות המשך כמו "תני משהו יותר פשוט" (בלי מילת מפתח) עדיין ימצאו
+    // מוצרים/מתכונים רלוונטיים, מרחיבים את טקסט החיפוש עם ההודעות האחרונות של הלקוח.
+    const recentUserMessages = (Array.isArray(history) ? history : [])
+      .filter(h => h.role === 'user')
+      .slice(-2)
+      .map(h => h.content);
+    const searchContext = [...recentUserMessages, message].join(' ');
+
+    const systemPrompt = buildSystemPrompt(message, searchContext);
 
     // history הוא מערך אופציונלי של הודעות קודמות בפורמט [{role: 'user'|'assistant', content: '...'}]
     const messages = [
