@@ -79,4 +79,63 @@ function buildSystemPrompt(userMessage) {
 3. תמיד לצטט את הקישור (url) בדיוק כפי שהוא מופיע ברשימה, מילה במילה - אסור לקצר, לשנות, או להמציא קישור.
 4. להציע מתכונים ורעיונות בישול על סמך הידע הכללי שלך - זה לא חייב להיות מוגבל למידע שכאן, ואפשר לשלב בהם המלצה למוצר מהרשימה (עם קישור מדויק) אם רלוונטי.
 5. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
-6. אם נשאלת שאלה שאין עליה מידע (למשל ייעוץ רפואי, כשרות של מוצר ספציפי שלא ברשימה), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר
+6. אם נשאלת שאלה שאין עליה מידע (למשל ייעוץ רפואי, כשרות של מוצר ספציפי שלא ברשימה), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351.
+7. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
+
+מידע נפוץ (FAQ):
+${faqText}
+
+מוצרים רלוונטיים לשאלה הנוכחית:
+${productsText}`;
+}
+
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body;
+
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'חסרה הודעה (message) בבקשה' });
+    }
+
+    const systemPrompt = buildSystemPrompt(message);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...(Array.isArray(history) ? history : []),
+      { role: 'user', content: message },
+    ];
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages,
+        temperature: 0.6,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('OpenAI API error:', errText);
+      return res.status(502).json({ error: 'שגיאה בפנייה ל-OpenAI API' });
+    }
+
+    const data = await response.json();
+    const reply = data.choices?.[0]?.message?.content?.trim() || 'מצטער, לא הצלחתי לייצר תשובה כרגע.';
+
+    res.json({ reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'שגיאת שרת פנימית' });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, () => {
+  console.log(`השרת פועל על פורט ${PORT}`);
+});
