@@ -1,0 +1,157 @@
+// ווידג'ט צ'אט להטמעה באתר.
+// שימוש: <script src="https://YOUR-SERVER-URL/widget.js" data-endpoint="https://YOUR-SERVER-URL/api/chat"></script>
+
+(function () {
+  const scriptTag = document.currentScript;
+  const endpoint = scriptTag.getAttribute('data-endpoint') || '/api/chat';
+
+  let history = [];
+
+  // --- עיצוב בסיסי ---
+  const style = document.createElement('style');
+  style.textContent = `
+    #sai-bubble { position: fixed; bottom: 20px; left: 20px; width: 56px; height: 56px; border-radius: 50%;
+      background: #1D9E75; color: white; display: flex; align-items: center; justify-content: center;
+      cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,0.2); font-size: 26px; z-index: 999999; }
+    #sai-window { position: fixed; bottom: 88px; left: 20px; width: 340px; max-width: 90vw; height: 480px;
+      background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.2); display: none;
+      flex-direction: column; overflow: hidden; z-index: 999999; font-family: sans-serif; direction: rtl; }
+    #sai-window.sai-open { display: flex; }
+    #sai-header { background: #1D9E75; color: white; padding: 12px 16px; font-size: 14px; font-weight: 600; }
+    #sai-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+    .sai-msg { max-width: 80%; padding: 8px 12px; border-radius: 10px; line-height: 1.5; white-space: pre-wrap; }
+    .sai-user { align-self: flex-start; background: #f1f1ef; color: #222; }
+    .sai-bot { align-self: flex-end; background: #e1f5ee; color: #085041; }
+    #sai-inputrow { display: flex; gap: 6px; padding: 10px; border-top: 1px solid #eee; }
+    #sai-input { flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; }
+    #sai-send { background: #1D9E75; color: white; border: none; border-radius: 8px; padding: 0 14px; cursor: pointer; }
+    #sai-human { padding: 8px 12px; font-size: 11px; color: #888; text-align: center; border-top: 1px solid #f2f2f2; }
+    #sai-human a { color: #1D9E75; }
+  `;
+  document.head.appendChild(style);
+
+  // --- בניית ה-DOM ---
+  const bubble = document.createElement('div');
+  bubble.id = 'sai-bubble';
+  bubble.innerText = '💬';
+  document.body.appendChild(bubble);
+
+  const win = document.createElement('div');
+  win.id = 'sai-window';
+  win.innerHTML = `
+    <div id="sai-header">המדריך שלנו</div>
+    <div id="sai-msgs"></div>
+    <div id="sai-inputrow">
+      <input id="sai-input" type="text" placeholder="כתבו הודעה..." />
+      <button id="sai-send">שלח</button>
+    </div>
+    <div id="sai-human">מעדיפים לדבר עם נציג אנושי? <a href="https://wa.me/972523030351" target="_blank" rel="noopener">לחצו כאן לוואטסאפ</a></div>
+  `;
+  document.body.appendChild(win);
+
+  const msgsEl = win.querySelector('#sai-msgs');
+  const inputEl = win.querySelector('#sai-input');
+  const sendBtn = win.querySelector('#sai-send');
+
+  function openChat() {
+    win.classList.add('sai-open');
+    if (msgsEl.children.length === 0) {
+      addMessage('bot', 'שלום! איך אפשר לעזור? אפשר לשאול אותי על מוצרים, משלוחים, או אפילו לבקש מתכון :)');
+    }
+  }
+
+  bubble.addEventListener('click', () => {
+    if (win.classList.contains('sai-open')) {
+      win.classList.remove('sai-open');
+    } else {
+      openChat();
+    }
+  });
+
+  // --- תפיסת כפתור וואטסאפ קיים באתר (אם יש), או לינק ייעודי #ai-chat ---
+  // במקום לחפש את הכפתור פעם אחת (מה שיכול "לפספס" אותו אם הוא נוצר מאוחר יותר ע"י תוסף),
+  // מאזינים ללחיצות על כל המסמך ובודקים אם הלחיצה הייתה בתוך קישור מתאים - זה עובד
+  // בלי קשר לתזמון הטעינה של הכפתור.
+  const WA_SELECTOR = 'a[href*="#ai-chat"], a[href*="wa.me"], a[href*="wa.link"], a[href*="api.whatsapp.com"], a[href*="whatsapp.com/send"]';
+
+  document.addEventListener('click', (e) => {
+    const match = e.target.closest(WA_SELECTOR);
+    if (match) {
+      e.preventDefault();
+      e.stopPropagation();
+      openChat();
+    }
+  }, true);
+
+  // מסתירים את הבועה שלנו רק אם וכאשר מזהים שקיים כפתור מתאים באתר (בכל שלב, גם אם הוא
+  // נוצר אחרי טעינת הדף), כדי שלא יהיו שני כפתורים כפולים על המסך.
+  function hideBubbleIfWaButtonExists() {
+    if (document.querySelector(WA_SELECTOR)) {
+      bubble.style.display = 'none';
+    }
+  }
+  hideBubbleIfWaButtonExists();
+  document.addEventListener('DOMContentLoaded', hideBubbleIfWaButtonExists);
+  window.addEventListener('load', hideBubbleIfWaButtonExists);
+  new MutationObserver(hideBubbleIfWaButtonExists).observe(document.body || document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  function linkify(text) {
+    const escaped = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+      const clean = url.replace(/[.,)\]]+$/, '');
+      return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>`;
+    });
+  }
+
+  function addMessage(who, text) {
+    const el = document.createElement('div');
+    el.className = 'sai-msg ' + (who === 'user' ? 'sai-user' : 'sai-bot');
+    if (who === 'user') {
+      el.innerText = text;
+    } else {
+      el.innerHTML = linkify(text);
+    }
+    msgsEl.appendChild(el);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = '';
+    addMessage('user', text);
+    history.push({ role: 'user', content: text });
+
+    addMessage('bot', '...');
+    const loadingEl = msgsEl.lastChild;
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, history }),
+      });
+      const data = await res.json();
+      loadingEl.remove();
+
+      if (data.reply) {
+        addMessage('bot', data.reply);
+        history.push({ role: 'assistant', content: data.reply });
+      } else {
+        addMessage('bot', 'מצטערים, הייתה תקלה. נסו שוב מאוחר יותר.');
+      }
+    } catch (e) {
+      loadingEl.remove();
+      addMessage('bot', 'מצטערים, לא הצלחנו להתחבר לשרת.');
+    }
+  }
+
+  sendBtn.addEventListener('click', sendMessage);
+  inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+})();
