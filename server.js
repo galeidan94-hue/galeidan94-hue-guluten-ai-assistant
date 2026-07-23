@@ -112,7 +112,44 @@ function stripHebrewSuffix(word) {
   return word;
 }
 
-// תעתיק בין עברית לאנגלית לשמות מותגים נפוצים - כדי ש"שר" ימצא גם "SCHAR" ולהפך.
+// פתרון כללי (לא רק לפי מילון ידני) לתעתיק מותגים: הופכים מילה עברית ל"שלד עיצורים"
+// (משמיטים תנועות ואותיות א/ה/ו/י שלא ברור אם הן עיצור או תנועה), ואותו דבר למילה
+// לטינית (משמיטים תנועות aeiou) - כך ש"נוטרזן" ו-"NutraZen" מגיעים לאותו שלד "ntrzn".
+const HEBREW_TO_LATIN_CONSONANT = {
+  'ב': 'b', 'ג': 'g', 'ד': 'd', 'ז': 'z', 'ח': 'h', 'ט': 't',
+  'כ': 'k', 'ך': 'k', 'ל': 'l', 'מ': 'm', 'ם': 'm', 'נ': 'n', 'ן': 'n',
+  'ס': 's', 'פ': 'p', 'ף': 'p', 'צ': 'tz', 'ץ': 'tz', 'ק': 'k', 'ר': 'r',
+  'ש': 's', 'ת': 't',
+};
+
+function hebrewConsonantSkeleton(word) {
+  let out = '';
+  for (const ch of word) {
+    if (HEBREW_TO_LATIN_CONSONANT[ch]) out += HEBREW_TO_LATIN_CONSONANT[ch];
+  }
+  return out;
+}
+
+function latinConsonantSkeleton(word) {
+  return word.toLowerCase().replace(/[aeiou]/g, '');
+}
+
+// בודק אם למילה עברית יש מילה לטינית "מתחזה" (brand transliterated) בתוך הטקסט,
+// לפי השוואת שלד העיצורים (זהה, או קרוב מאוד - הפרש של תו אחד).
+function matchesTransliteratedBrand(haystack, hebrewToken) {
+  if (!/^[\u0590-\u05FF]+$/.test(hebrewToken) || hebrewToken.length < 3) return false;
+  const targetSkeleton = hebrewConsonantSkeleton(hebrewToken);
+  if (targetSkeleton.length < 3) return false;
+  const latinWords = haystack.match(/[A-Za-z]+/g) || [];
+  return latinWords.some(w => {
+    const sk = latinConsonantSkeleton(w);
+    return sk.length >= 3 && (sk === targetSkeleton || levenshteinLite(sk, targetSkeleton) <= 1);
+  });
+}
+
+// תעתיק בין עברית לאנגלית לשמות מותגים ספציפיים עם הגייה יוצאת דופן (למשל "שר"
+// הוא תעתיק ל-"Schar" הגרמני/איטלקי - "sch" מייצג צליל אחד, מה ששלד-עיצורים כללי
+// היה מפספס). למותגים "רגילים" יותר, matchesTransliteratedBrand למעלה מספיק לבד.
 const TRANSLITERATION_MAP = {
   'שר': 'schar', 'שאר': 'schar',
   'מולינו': 'molino',
@@ -148,6 +185,7 @@ function levenshteinLite(a, b) {
 
 function fuzzyIncludes(haystack, token) {
   if (haystack.includes(token)) return true;
+  if (matchesTransliteratedBrand(haystack, token)) return true;
   if (token.length < 4) return false; // מילים קצרות מדי - הטשטוש עלול להיות מטעה
   const words = haystack.split(/\s+/);
   return words.some(w => w.length >= 3 && levenshteinLite(w, token) <= 1);
