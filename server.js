@@ -138,6 +138,7 @@ function latinConsonantSkeleton(word) {
 // לפי השוואת שלד העיצורים (זהה, או קרוב מאוד - הפרש של תו אחד).
 function matchesTransliteratedBrand(haystack, hebrewToken) {
   if (!/^[\u0590-\u05FF]+$/.test(hebrewToken) || hebrewToken.length < 3) return false;
+  if (!/[A-Za-z]/.test(haystack)) return false; // אין בכלל אותיות לטיניות - לא שווה לבדוק
   const targetSkeleton = hebrewConsonantSkeleton(hebrewToken);
   if (targetSkeleton.length < 3) return false;
   const latinWords = haystack.match(/[A-Za-z]+/g) || [];
@@ -183,9 +184,9 @@ function levenshteinLite(a, b) {
   return dp[a.length][b.length];
 }
 
-function fuzzyIncludes(haystack, token) {
+function fuzzyIncludes(haystack, token, tryTransliteration = true) {
   if (haystack.includes(token)) return true;
-  if (matchesTransliteratedBrand(haystack, token)) return true;
+  if (tryTransliteration && matchesTransliteratedBrand(haystack, token)) return true;
   if (token.length < 4) return false; // מילים קצרות מדי - הטשטוש עלול להיות מטעה
   const words = haystack.split(/\s+/);
   return words.some(w => w.length >= 3 && levenshteinLite(w, token) <= 1);
@@ -216,7 +217,7 @@ function searchProducts(query, products, limit = 15) {
   if (exclusions.length) {
     candidates = candidates.filter(p => {
       const haystack = `${p.name} ${p.description}`;
-      return !exclusions.some(ex => fuzzyIncludes(haystack, ex));
+      return !exclusions.some(ex => haystack.includes(ex));
     });
   }
 
@@ -225,7 +226,7 @@ function searchProducts(query, products, limit = 15) {
     for (const t of tokens) {
       if (fuzzyIncludes(p.name, t)) score += 3;
       else if (fuzzyIncludes(p.category, t)) score += 2;
-      else if (fuzzyIncludes(p.description, t)) score += 1;
+      else if (p.description.includes(t)) score += 1;
     }
     return { p, score };
   }).filter(x => tokens.length ? x.score > 0 : true);
@@ -242,7 +243,7 @@ function searchRecipes(query, recipes, limit = 3) {
     const haystack = `${r.title} ${r.tags} ${r.summary || ''} ${(r.ingredients || []).join(' ')} ${(r.steps || []).join(' ')}`;
     let score = 0;
     for (const t of tokens) {
-      if (fuzzyIncludes(haystack, t)) score += 1;
+      if (fuzzyIncludes(haystack, t, false)) score += 1;
     }
     return { r, score };
   }).filter(x => x.score > 0);
@@ -259,7 +260,7 @@ function searchExternalRecipes(query, externalRecipes, limit = 3) {
     const haystack = `${r.title} ${r.tags}`;
     let score = 0;
     for (const t of tokens) {
-      if (fuzzyIncludes(haystack, t)) score += 1;
+      if (fuzzyIncludes(haystack, t, false)) score += 1;
     }
     return { r, score };
   }).filter(x => x.score > 0);
