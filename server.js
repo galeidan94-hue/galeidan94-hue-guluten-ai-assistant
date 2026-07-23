@@ -22,7 +22,7 @@ if (!OPENAI_API_KEY) {
 
 // בסיס הידע נטען פעם אחת לזיכרון ומתעדכן כל כמה דקות - כך שאין קריאת דיסק
 // יקרה בכל בקשה, אבל עדכון קבצים עדיין נכנס לתוקף בלי להפעיל מחדש את השרת.
-let cache = { faq: [], products: [], recipes: [], loadedAt: 0 };
+let cache = { faq: [], products: [], recipes: [], externalRecipes: [], loadedAt: 0 };
 const RELOAD_INTERVAL_MS = 5 * 60 * 1000; // 5 דקות
 
 function loadKnowledge() {
@@ -38,7 +38,13 @@ function loadKnowledge() {
   } catch (e) {
     recipes = [];
   }
-  cache = { faq, products, recipes, loadedAt: now };
+  let externalRecipes = [];
+  try {
+    externalRecipes = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'external_recipes.json'), 'utf8'));
+  } catch (e) {
+    externalRecipes = [];
+  }
+  cache = { faq, products, recipes, externalRecipes, loadedAt: now };
   return cache;
 }
 
@@ -84,6 +90,60 @@ function stripHebrewPrefixes(word) {
   return [...variants];
 }
 
+// מטפל גם בסיומות ריבוי/יחיד ("עוגייה"/"עוגיות") - מוריד סיומות נפוצות כדי
+// לקבל צורת "שורש" גסה שמתאימה לשתי הצורות.
+const HEBREW_SUFFIXES = ['יות', 'ות', 'ים', 'יה', 'ה'];
+
+function stripHebrewSuffix(word) {
+  for (const suf of HEBREW_SUFFIXES) {
+    if (word.length > suf.length + 2 && word.endsWith(suf)) {
+      return word.slice(0, -suf.length);
+    }
+  }
+  return word;
+}
+
+// תעתיק בין עברית לאנגלית לשמות מותגים נפוצים - כדי ש"שר" ימצא גם "SCHAR" ולהפך.
+const TRANSLITERATION_MAP = {
+  'שר': 'schar', 'שאר': 'schar',
+  'מולינו': 'molino',
+  'תמי': 'tami', 'תמי4': 'tami4',
+};
+const REVERSE_TRANSLITERATION = Object.fromEntries(
+  Object.entries(TRANSLITERATION_MAP).map(([he, en]) => [en, he])
+);
+
+function transliterate(word) {
+  const lower = word.toLowerCase();
+  const variants = [word];
+  if (TRANSLITERATION_MAP[word]) variants.push(TRANSLITERATION_MAP[word]);
+  if (REVERSE_TRANSLITERATION[lower]) variants.push(REVERSE_TRANSLITERATION[lower]);
+  return variants;
+}
+
+// חיפוש "מטושטש" (fuzzy) בין שתי מילים קצרות - סופר כמה תווים שונים בין המילים
+// (מרחק עריכה גס), כדי לתפוס שגיאות הקלדה קטנות ("שוקולט" במקום "שוקולד").
+function levenshteinLite(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return 99;
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function fuzzyIncludes(haystack, token) {
+  if (haystack.includes(token)) return true;
+  if (token.length < 4) return false; // מילים קצרות מדי - הטשטוש עלול להיות מטעה
+  const words = haystack.split(/\s+/);
+  return words.some(w => w.length >= 3 && levenshteinLite(w, token) <= 1);
+}
+
 function tokenize(text, excludeWords = []) {
   const excludeSet = new Set(excludeWords);
   const rawWords = text
@@ -92,7 +152,11 @@ function tokenize(text, excludeWords = []) {
     .map(w => w.trim())
     .filter(w => w.length >= 2 && !STOPWORDS.has(w) && !excludeSet.has(w));
 
-  const withVariants = rawWords.flatMap(w => stripHebrewPrefixes(w));
+  const withVariants = rawWords.flatMap(w => {
+    const prefixVariants = stripHebrewPrefixes(w);
+    const allVariants = prefixVariants.flatMap(v => [v, stripHebrewSuffix(v)]);
+    return allVariants.flatMap(v => transliterate(v));
+  });
   return [...new Set(withVariants)];
 }
 
@@ -105,7 +169,7 @@ function searchProducts(query, products, limit = 15) {
   if (exclusions.length) {
     candidates = candidates.filter(p => {
       const haystack = `${p.name} ${p.description}`;
-      return !exclusions.some(ex => haystack.includes(ex));
+      return !exclusions.some(ex => fuzzyIncludes(haystack, ex));
     });
   }
 
@@ -113,7 +177,7 @@ function searchProducts(query, products, limit = 15) {
     const haystack = `${p.name} ${p.category} ${p.description}`;
     let score = 0;
     for (const t of tokens) {
-      if (haystack.includes(t)) score += 1;
+      if (fuzzyIncludes(haystack, t)) score += 1;
     }
     return { p, score };
   }).filter(x => tokens.length ? x.score > 0 : true);
@@ -130,7 +194,24 @@ function searchRecipes(query, recipes, limit = 3) {
     const haystack = `${r.title} ${r.tags} ${r.summary || ''} ${(r.ingredients || []).join(' ')} ${(r.steps || []).join(' ')}`;
     let score = 0;
     for (const t of tokens) {
-      if (haystack.includes(t)) score += 1;
+      if (fuzzyIncludes(haystack, t)) score += 1;
+    }
+    return { r, score };
+  }).filter(x => x.score > 0);
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(x => x.r);
+}
+
+function searchExternalRecipes(query, externalRecipes, limit = 3) {
+  const tokens = tokenize(query);
+  if (!tokens.length || !externalRecipes.length) return [];
+
+  const scored = externalRecipes.map(r => {
+    const haystack = `${r.title} ${r.tags}`;
+    let score = 0;
+    for (const t of tokens) {
+      if (fuzzyIncludes(haystack, t)) score += 1;
     }
     return { r, score };
   }).filter(x => x.score > 0);
@@ -140,7 +221,7 @@ function searchRecipes(query, recipes, limit = 3) {
 }
 
 function buildSystemPrompt(userMessage, searchContext) {
-  const { faq, products, recipes } = loadKnowledge();
+  const { faq, products, recipes, externalRecipes } = loadKnowledge();
   const queryForSearch = searchContext || userMessage;
 
   const faqText = faq.map(f => `שאלה: ${f.question}\nתשובה: ${f.answer}`).join('\n\n');
@@ -150,7 +231,7 @@ function buildSystemPrompt(userMessage, searchContext) {
     ? relevant.map(p =>
         `- ${p.name} | קטגוריה: ${p.category} | מחיר: ${p.price} ש"ח | במלאי: ${p.in_stock ? 'כן' : 'לא'} | קישור: ${p.url}\n  תיאור ורכיבים: ${p.description}`
       ).join('\n')
-    : '(לא נמצאו מוצרים תואמים לשאלה זו מתוך החיפוש האוטומטי - אם השאלה עוסקת במוצר ספציפי, אפשר להציע ללקוח לחפש באתר או לשאול בניסוח אחר.)';
+    : '(לא נמצאו מוצרים תואמים לשאלה זו מתוך החיפוש האוטומטי)';
 
   const relevantRecipes = searchRecipes(queryForSearch, recipes);
   const recipesText = relevantRecipes.length
@@ -161,23 +242,40 @@ function buildSystemPrompt(userMessage, searchContext) {
       }).join('\n\n')
     : '(אין כרגע מתכון תואם ידוע מהבלוג שלנו לשאלה הזו)';
 
+  const relevantExternal = searchExternalRecipes(queryForSearch, externalRecipes);
+  const externalRecipesText = relevantExternal.length
+    ? relevantExternal.map(r => `- ${r.title} | מקור: ${r.source} | קישור: ${r.url}`).join('\n')
+    : '(אין מתכון חיצוני תואם ידוע)';
+
   const productCategories = [...new Set(products.map(p => p.category).filter(Boolean))];
   const recipeCategories = [...new Set(
     recipes.flatMap(r => (r.tags || '').split(',').map(t => t.trim()).filter(Boolean))
   )];
 
-  return `את/ה עוזר/ת AI ידידותי/ת של חנות "גולוטן" - חנות אונליין למוצרים ללא גלוטן. תפקידך:
+  return `את/ה עוזר/ת AI ידידותי/ת ומכירתי/ת של חנות "גולוטן" - חנות אונליין למוצרים ללא גלוטן. תפקידך:
+
 1. לענות על שאלות נפוצות בהתאם למידע שמופיע כאן בלבד - אסור להמציא מדיניות שלא מופיעה במידע.
+
 2. חשוב מאוד לגבי מתכונים ובישול:
-   - יש לך למטה רשימת "מתכונים תואמים מהבלוג שלנו" - כל מתכון שם כולל מרכיבים מדויקים ושלבי הכנה מלאים. אם הרשימה לא ריקה, את/ה **חייב/ת** לתת ללקוח את תוכן המתכון בפועל (מרכיבים ושלבים עיקריים, אפשר בקצרה) יחד עם הקישור המדויק שלו - לא רק להזכיר שהוא קיים, אלא לעזור בפועל עם התוכן שלו.
+   - יש לך למטה רשימת "מתכונים תואמים מהבלוג שלנו" - כל מתכון שם כולל מרכיבים מדויקים ושלבי הכנה מלאים. אם הרשימה לא ריקה, את/ה **חייב/ת** לתת ללקוח את תוכן המתכון בפועל (מרכיבים ושלבים עיקריים, אפשר בקצרה) יחד עם הקישור המדויק שלו - לא רק להזכיר שהוא קיים.
    - אם יש כמה מתכונים תואמים, אפשר להזכיר את כולם בקצרה ולתת קישור לכל אחד, ולהתמקד במתכון המתאים ביותר.
-   - אם אין שום מתכון תואם ברשימה: אל תמציא/י מתכון מיד. קודם תשאל/י את הלקוח בנימוס: "אין לנו כרגע מתכון כזה בבלוג שלנו - תרצה/י שאציע לך רעיון כללי, או שנפנה אותך לחפש בעמוד המתכונים שלנו: https://guluten.co.il/מתכונים?". רק אם הלקוח מאשר שהוא רוצה הצעה כללית, אפשר לתת רעיון מתכון מהידע הכללי שלך על בישול ואפייה ללא גלוטן (כולל סוגי קמחים ללא גלוטן) - אבל תמיד לציין בבירור שזו הצעה כללית ולא מתכון מהבלוג שלנו.
-   - אסור להמציא קישור למתכון ספציפי שלא מופיע ברשימה שסופקה.
-3. חשוב לגבי מוצרים: להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה, ומסננת אוטומטית מוצרים עם רכיבים שהלקוח ביקש להימנע מהם) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. כל מוצר כולל תיאור עם רכיבים ואלרגנים אמיתיים - השתמש/י בהם כדי לענות על שאלות כמו "יש בזה סויה?" או "מה מתאים למישהו שנמנע מסוכר?". אם השאלה עוסקת במוצר ספציפי שלא נמצא ברשימה, אמור בכנות שאין לך מידע מדויק עליו ברגע זה, והצע ללקוח לחפש אותו באתר או לנסח את השאלה אחרת - אל תנחש. תמיד לצטט את הקישור (url) של מוצר בדיוק כפי שהוא מופיע ברשימה, מילה במילה.
-4. קטגוריות: יש לך למטה רשימה של כל קטגוריות המוצרים והמתכונים שקיימות בחנות. אם לקוח שואל "אילו סוגים יש לכם של X" או מחפש קטגוריה כללית, אפשר להיעזר ברשימה הזו כדי לענות בביטחון אילו קטגוריות קיימות, גם אם החיפוש האוטומטי לא החזיר מוצרים ספציפיים.
-5. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
-6. אם נשאלת שאלה שאין עליה מידע מדויק על החנות עצמה (למשל כשרות של מוצר ספציפי שלא ברשימה, מדיניות שלא מופיעה כאן), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351. הכלל הזה חל על עובדות ספציפיות על החנות/המוצרים - לא על ידע כללי בבישול, מתכונים, או תזונה, ששם מותר לך לענות בביטחון מהידע הכללי שלך (בכפוף לכלל 2 לגבי בקשת אישור לפני הצעת מתכון חיצוני).
-7. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
+   - אם אין שום מתכון תואם ברשימה הפנימית, בדוק/י את רשימת "מתכונים ממקורות חיצוניים" למטה. אם יש שם התאמה, הצע/י אותה תוך ציון ברור של המקור (למשל "מצאתי מתכון כזה באתר קמח הארץ") וקישור - ותמיד ציין/י שזה לא מהבלוג שלנו.
+   - אם גם ברשימה החיצונית אין התאמה: אל תמציא/י מתכון מיד. קודם שאל/י את הלקוח בנימוס: "אין לנו כרגע מתכון כזה בבלוג שלנו - תרצה/י שאציע לך רעיון כללי מהידע שלי, או שנפנה אותך לחפש בעמוד המתכונים שלנו: https://guluten.co.il/מתכונים?". רק אם הלקוח מאשר, תני/תן רעיון מהידע הכללי שלך על בישול ואפייה ללא גלוטן (כולל סוגי קמחים) - ותמיד ציין/י בבירור שזו הצעה כללית, לא ממקור ספציפי.
+   - אסור להמציא קישור למתכון ספציפי שלא מופיע באחת משתי הרשימות.
+
+3. חשוב לגבי מוצרים: להמליץ על מוצרים אך ורק מתוך הרשימה הרלוונטית שמופיעה כאן (זו תת-קבוצה מתוך קטלוג של כ-1100 מוצרים פעילים, שנבחרה אוטומטית לפי השאלה, ומסננת אוטומטית מוצרים עם רכיבים שהלקוח ביקש להימנע מהם) - אסור בהחלט להמציא שם מוצר, מחיר, או פרט שלא מופיע במפורש ברשימה הזו. כל מוצר כולל תיאור עם רכיבים ואלרגנים אמיתיים - השתמש/י בהם לענות על שאלות כמו "יש בזה סויה?". תמיד לצטט את הקישור (url) של מוצר בדיוק כפי שהוא מופיע ברשימה, מילה במילה.
+
+4. אם לקוח מזכיר מוצר בשם לא מדויק (טעות כתיבה, אנגלית-עברית מעורבב, יחיד/רבים) - נסה/י להבין לאיזה מוצר הכוונה מתוך הרשימה שסופקה. אם עדיין לא ברור לאיזה מוצר בדיוק הכוונה, או שלא נמצאה התאמה טובה, אל תגיד/י סתם "אין לי מידע" - במקום זה שאל/י שאלה מכוונת אחת שתעזור לצמצם (לדוגמה: "איזה סוג מוצר בדיוק - חטיף, קמח, או משהו אחר?" או "זה למאכל מתוק או מלוח?"), ואז הצע/י את המוצר המתאים ביותר מהרשימה.
+
+5. חשוב מאוד - טון מכירתי וחם: המטרה היא לעזור ללקוח למצוא בדיוק מה שהוא צריך ולעודד רכישה. בכל תשובה, כשרלוונטי, הצע/י בעדינות צעד הבא: מוצר משלים לקנייה (לדוגמה: נשאל על קרקר - הצע/י גם ממרח מתאים; נשאל על קמח מסוים - הצע/י מתכון שמשתמש בו), או הזכר/י שיש קטגוריית "מבצעים" בחנות אם רלוונטי. תמיד בטון נעים ולא נודניקי - הצעה, לא לחץ.
+
+6. קטגוריות: יש לך למטה רשימה של כל קטגוריות המוצרים והמתכונים שקיימות בחנות. אם לקוח שואל "אילו סוגים יש לכם של X", אפשר להיעזר ברשימה הזו כדי לענות בביטחון אילו קטגוריות קיימות, גם אם החיפוש האוטומטי לא החזיר תוצאות ספציפיות.
+
+7. לענות בעברית, בטון חם וידידותי, בקצרה וברורה.
+
+8. אם נשאלת שאלה שאין עליה מידע מדויק על החנות עצמה (למשל כשרות של מוצר ספציפי שלא ברשימה, מדיניות שלא מופיעה כאן), אמור בכנות שאין לך את המידע המדויק והפנה ליצירת קשר בוואטסאפ במספר 052-3030351. הכלל הזה חל על עובדות ספציפיות על החנות/המוצרים - לא על ידע כללי בבישול, מתכונים, או תזונה.
+
+9. כל המוצרים בחנות ללא גלוטן - זה לא צריך לצוין כל פעם כי זה מובן מאליו לחנות הזו.
 
 מידע נפוץ (FAQ):
 ${faqText}
@@ -187,6 +285,9 @@ ${productsText}
 
 מתכונים תואמים מהבלוג שלנו:
 ${recipesText}
+
+מתכונים ממקורות חיצוניים (רק כגיבוי, תמיד לציין את המקור):
+${externalRecipesText}
 
 קטגוריות מוצרים קיימות בחנות:
 ${productCategories.join(', ')}
