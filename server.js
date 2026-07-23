@@ -222,9 +222,11 @@ function searchProducts(query, products, limit = 15) {
   }
 
   const scored = candidates.map(p => {
+    const firstWord = p.name.split(' ')[0] || '';
     let score = 0;
     for (const t of tokens) {
-      if (fuzzyIncludes(p.name, t)) score += 3;
+      if (fuzzyIncludes(firstWord, t)) score += 4; // התאמה למילה הראשונה בשם (בד"כ המותג) - החזקה ביותר
+      else if (fuzzyIncludes(p.name, t)) score += 3;
       else if (fuzzyIncludes(p.category, t)) score += 2;
       else if (p.description.includes(t)) score += 1;
     }
