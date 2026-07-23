@@ -92,12 +92,21 @@ function stripHebrewPrefixes(word) {
 
 // מטפל גם בסיומות ריבוי/יחיד ("עוגייה"/"עוגיות") - מוריד סיומות נפוצות כדי
 // לקבל צורת "שורש" גסה שמתאימה לשתי הצורות.
-const HEBREW_SUFFIXES = ['יות', 'ות', 'ים', 'יה', 'ה'];
+const HEBREW_SUFFIXES = ['יות', 'ות', 'ים', 'יה', 'ה', 'י'];
+
+// כשמורידים סיומת, אות סופית (ם/ן/ך/ף/ץ) שהופיעה כ"רגילה" באמצע המילה המקורית
+// ("לחמי") צריכה לחזור לצורתה הסופית ("לחם") כי היא עכשיו סוף המילה.
+const FINAL_LETTER_MAP = { 'כ': 'ך', 'מ': 'ם', 'נ': 'ן', 'פ': 'ף', 'צ': 'ץ' };
 
 function stripHebrewSuffix(word) {
   for (const suf of HEBREW_SUFFIXES) {
     if (word.length > suf.length + 2 && word.endsWith(suf)) {
-      return word.slice(0, -suf.length);
+      const stripped = word.slice(0, -suf.length);
+      const lastChar = stripped[stripped.length - 1];
+      if (FINAL_LETTER_MAP[lastChar]) {
+        return stripped.slice(0, -1) + FINAL_LETTER_MAP[lastChar];
+      }
+      return stripped;
     }
   }
   return word;
@@ -174,10 +183,11 @@ function searchProducts(query, products, limit = 15) {
   }
 
   const scored = candidates.map(p => {
-    const haystack = `${p.name} ${p.category} ${p.description}`;
     let score = 0;
     for (const t of tokens) {
-      if (fuzzyIncludes(haystack, t)) score += 1;
+      if (fuzzyIncludes(p.name, t)) score += 3;
+      else if (fuzzyIncludes(p.category, t)) score += 2;
+      else if (fuzzyIncludes(p.description, t)) score += 1;
     }
     return { p, score };
   }).filter(x => tokens.length ? x.score > 0 : true);
